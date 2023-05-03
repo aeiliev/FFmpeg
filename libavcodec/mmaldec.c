@@ -122,7 +122,7 @@ static void ffmmal_release_frame(void *opaque, uint8_t *data)
 
 // Setup frame with a new reference to buffer. The buffer must have been
 // allocated from the given pool.
-static int ffmmal_set_ref(AVFrame *frame, FFPoolRef *pool,
+static int ffmmal_set_ref(AVCodecContext *avctx, AVFrame *frame, FFPoolRef *pool,
                           MMAL_BUFFER_HEADER_T *buffer)
 {
     FFBufferRef *ref = av_mallocz(sizeof(*ref));
@@ -143,8 +143,19 @@ static int ffmmal_set_ref(AVFrame *frame, FFPoolRef *pool,
     atomic_fetch_add_explicit(&ref->pool->refcount, 1, memory_order_relaxed);
     mmal_buffer_header_acquire(buffer);
 
-    frame->format = AV_PIX_FMT_MMAL;
-    frame->data[3] = (uint8_t *)ref->buffer;
+    frame->format = avctx->pix_fmt;
+
+    if (avctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+        int w = FFALIGN(avctx->width, 32);
+        int h = FFALIGN(avctx->height, 16);
+
+        av_image_fill_arrays(frame->data, frame->linesize,
+                buffer->data + buffer->type->video.offset[0],
+                avctx->pix_fmt, w, h, 1);
+    } else {
+        frame->data[3] = (uint8_t *)ref->buffer;
+    }
+
     return 0;
 }
 
@@ -380,6 +391,9 @@ static av_cold int ffmmal_init_decoder(AVCodecContext *avctx)
     format_in = decoder->input[0]->format;
     format_in->type = MMAL_ES_TYPE_VIDEO;
     switch (avctx->codec_id) {
+    case AV_CODEC_ID_MJPEG:
+        format_in->encoding = MMAL_ENCODING_MJPEG;
+        break;
     case AV_CODEC_ID_MPEG2VIDEO:
         format_in->encoding = MMAL_ENCODING_MP2V;
         break;
@@ -625,30 +639,14 @@ static int ffmal_copy_frame(AVCodecContext *avctx,  AVFrame *frame,
     frame->interlaced_frame = ctx->interlaced_frame;
     frame->top_field_first = ctx->top_field_first;
 
-    if (avctx->pix_fmt == AV_PIX_FMT_MMAL) {
-        if (!ctx->pool_out)
-            return AVERROR_UNKNOWN; // format change code failed with OOM previously
+    if (!ctx->pool_out)
+        return AVERROR_UNKNOWN; // format change code failed with OOM previously
 
-        if ((ret = ff_decode_frame_props(avctx, frame)) < 0)
-            goto done;
+    if ((ret = ff_decode_frame_props(avctx, frame)) < 0)
+        goto done;
 
-        if ((ret = ffmmal_set_ref(frame, ctx->pool_out, buffer)) < 0)
-            goto done;
-    } else {
-        int w = FFALIGN(avctx->width, 32);
-        int h = FFALIGN(avctx->height, 16);
-        uint8_t *src[4];
-        int linesize[4];
-
-        if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
-            goto done;
-
-        av_image_fill_arrays(src, linesize,
-                             buffer->data + buffer->type->video.offset[0],
-                             avctx->pix_fmt, w, h, 1);
-        av_image_copy(frame->data, frame->linesize, (const uint8_t **)src, linesize,
-                      avctx->pix_fmt, avctx->width, avctx->height);
-    }
+    if ((ret = ffmmal_set_ref(avctx, frame, ctx->pool_out, buffer)) < 0)
+        goto done;
 
     frame->sample_aspect_ratio = avctx->sample_aspect_ratio;
     frame->width  = avctx->width;
@@ -704,9 +702,13 @@ static int ffmmal_read_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                 goto done;
         }
 
-        ctx->eos_received |= !!(buffer->flags & MMAL_BUFFER_HEADER_FLAG_EOS);
-        if (ctx->eos_received)
+        int eos = !!(buffer->flags & MMAL_BUFFER_HEADER_FLAG_EOS);
+        if (eos) {
+            if (ctx->eos_sent) {
+                ctx->eos_received = 1;
+            }
             goto done;
+        }
 
         if (buffer->cmd == MMAL_EVENT_FORMAT_CHANGED) {
             MMAL_COMPONENT_T *decoder = ctx->decoder;
@@ -851,6 +853,7 @@ static const AVClass ffmmal_dec_class = {
     };
 
 FFMMAL_DEC(h264, AV_CODEC_ID_H264)
+FFMMAL_DEC(mjpeg, AV_CODEC_ID_MJPEG)
 FFMMAL_DEC(mpeg2, AV_CODEC_ID_MPEG2VIDEO)
 FFMMAL_DEC(mpeg4, AV_CODEC_ID_MPEG4)
 FFMMAL_DEC(vc1, AV_CODEC_ID_VC1)

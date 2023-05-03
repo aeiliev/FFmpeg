@@ -541,6 +541,9 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
                "Dequeued v4l2 buffer contains corrupted data (%d bytes).\n",
                buf.bytesused);
         buf.bytesused = 0;
+        enqueue_buffer(s, &buf);
+        av_packet_unref(pkt);
+        return FFERROR_REDO;
     } else
 #endif
     {
